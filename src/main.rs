@@ -183,7 +183,10 @@ fn handle_client(
             target_port,
             *handshake.protocol_version,
         )?;
-        info!("Queried status from {target_host} (port {target_port}). Own ping was {ping} ms.");
+        info!(
+            "Queried status from {} (port {}). Own ping was {ping} ms.",
+            handshake.server_address, handshake.server_port
+        );
 
         // Add own suffix to status from target server
         let suffix = format!("§8[§9Stupid MC Proxy: §3{ping}ms§8]");
@@ -288,6 +291,8 @@ fn handle_client(
 
     info!("Proxying raw data to each other...");
 
+    client.set_nodelay(true)?;
+    target.set_nodelay(true)?;
     client.set_nonblocking(true)?;
     target.set_nonblocking(true)?;
 

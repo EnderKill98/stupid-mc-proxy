@@ -1,17 +1,21 @@
 #![feature(addr_parse_ascii)]
 
 use crate::protocol::client::handshake::ClientHandshake;
+use crate::protocol::client::login::{ClientLoginStart, ClientLoginStartOnlyName};
 use crate::protocol::client::status::{ClientStatusPing, ClientStatusRequest};
 use crate::protocol::server::status::{ServerStatusPongPacket, ServerStatusResponsePacket};
-use crate::protocol::types::VarInt;
+use crate::protocol::types::{MinecraftDataType, VarInt};
 use crate::protocol::Packet;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use log::{error, info};
 use serde_json::Value;
-use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::io::{Cursor, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
+use tracing::span::EnteredSpan;
+use tracing::{span, Level};
+use tracing_subscriber::prelude::*;
 
 mod protocol;
 
@@ -32,27 +36,78 @@ fn main() -> Result<()> {
     if std::env::var("RUST_LOG").is_err() {
         std::env::set_var("RUST_LOG", "INFO");
     }
-    env_logger::builder().format_timestamp_millis().init();
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
 
     let server = TcpListener::bind(&opts.bind).context("Bind own server")?;
     info!("Ready");
 
     loop {
         let (client, addr) = server.accept().context("Accept new client")?;
-        info!("New client connected: {addr}");
         let target_host = opts.target_host.to_owned();
         let target_port = opts.target_port.to_owned();
         let verbose = opts.verbose;
         std::thread::spawn(move || {
-            if let Err(err) = handle_client(client, target_host, target_port) {
-                if verbose {
-                    error!("handle_client failed: {err:?}");
-                } else {
-                    error!("handle_client failed: {err}");
+            let entered_span = span!(
+                Level::INFO,
+                "conn",
+                ip = addr.ip().to_string(),
+                user = tracing::field::Empty
+            )
+            .entered();
+            info!("Connected to new client");
+            let start = Instant::now();
+            match handle_client(entered_span, client, target_host, target_port) {
+                Ok(_) => info!(
+                    "Connection finished after {}",
+                    format_duration(start.elapsed())
+                ),
+                Err(err) => {
+                    let duration_formatted = format_duration(start.elapsed());
+                    if verbose {
+                        error!("Finished with error after {duration_formatted}: {err:?}");
+                    } else {
+                        error!("Finished with error after {duration_formatted}: {err}");
+                    }
                 }
             }
         });
     }
+}
+
+fn format_duration(duration: Duration) -> String {
+    let mut millis = duration.as_millis();
+    let (mut hours, mut minutes, mut seconds) = (0, 0, 0);
+    if millis >= 1000 * 60 * 60 {
+        hours = millis / 1000 * 60 * 60;
+        millis %= 1000 * 60 * 60;
+    }
+    if millis >= 1000 * 60 {
+        millis = millis / 1000 * 60;
+        millis %= 1000 * 60;
+    }
+    if millis >= 1000 {
+        seconds = millis / 1000;
+        millis %= 1000;
+    }
+
+    let mut formatted = String::with_capacity(24);
+    if hours > 0 {
+        formatted.push_str(&format!("{hours}h"));
+    }
+    if minutes > 0 {
+        formatted.push_str(&format!("{minutes}m"));
+    }
+    if seconds > 0 {
+        formatted.push_str(&format!("{seconds}s"));
+    }
+    if hours == 0 && minutes == 0 && seconds < 10 {
+        formatted.push_str(&format!("{millis}ms"));
+    }
+
+    formatted
 }
 
 fn query_target_status_and_ping(
@@ -83,7 +138,12 @@ fn query_target_status_and_ping(
     Ok((serde_json::from_str(&status.json_response)?, ping))
 }
 
-fn handle_client(mut client: TcpStream, target_host: String, target_port: u16) -> Result<()> {
+fn handle_client(
+    entered_span: EnteredSpan,
+    mut client: TcpStream,
+    target_host: String,
+    target_port: u16,
+) -> Result<()> {
     // Resolve host
     // TODO: Improve on this ugliness!
     let addr_info = dns_lookup::getaddrinfo(Some(&target_host), None, None)
@@ -161,9 +221,10 @@ fn handle_client(mut client: TcpStream, target_host: String, target_port: u16) -
         handshake.server_address, handshake.server_port, handshake.protocol_version
     );
 
-    // Next state: Login (2)
     let mut target = TcpStream::connect(target_addr).context("Connect to target")?;
+    info!("Connected to target.");
 
+    // Next state: Login (2)
     // Forward handshake with modified (server/host) to target
     ClientHandshake {
         protocol_version: handshake.protocol_version,
@@ -174,10 +235,48 @@ fn handle_client(mut client: TcpStream, target_host: String, target_port: u16) -
     .write_with_header_to(&mut target)
     .context("Send handshake to target")?;
 
+    {
+        let (login_first_packet_id, login_first_packet_data) =
+            protocol::read_raw_packet_id_and_data(&mut client)?;
+        if login_first_packet_id != ClientLoginStart::packet_id() {
+            bail!(
+                "Expect to receive Packet LoginStart (id {}, but got {} instead)!",
+                ClientLoginStart::packet_id(),
+                login_first_packet_id
+            );
+        }
+
+        if let Ok(login_start) =
+            ClientLoginStart::from_cursor(&mut Cursor::new(login_first_packet_data.as_slice()))
+        {
+            info!(
+                "Client claims to be {} ({})",
+                login_start.username, login_start.uuid
+            );
+            entered_span.record("user", login_start.username);
+        } else {
+            let login_start = ClientLoginStartOnlyName::from_cursor(&mut Cursor::new(
+                login_first_packet_data.as_slice(),
+            ))?;
+            info!(
+                "Client claims to be {} (old format, so likely no uuid sent)",
+                login_start.username
+            );
+            entered_span.record("user", login_start.username);
+        }
+
+        // Forward exact received packet data to target (can vary between version)
+        let mut cursor = Cursor::new(Vec::with_capacity(4 + login_first_packet_data.len()));
+        login_first_packet_id.write_as_mc_type(&mut cursor)?;
+        cursor.write_all(&login_first_packet_data)?;
+        VarInt(cursor.position() as i32).write_as_mc_type(&mut target)?;
+        target.write_all(&cursor.into_inner())?;
+    }
+
+    info!("Proxying raw data to each other...");
+
     client.set_nonblocking(true)?;
     target.set_nonblocking(true)?;
-
-    info!("Connected to target. Proxying client to it in new thread...");
 
     let mut buf = vec![0u8; 4096 * 16];
     let mut buf_2 = Vec::with_capacity(4096 * 32);

@@ -1,5 +1,5 @@
-use std::io::{Cursor, Read};
 use crate::protocol::{types::*, Packet};
+use std::io::{Cursor, Read};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct ClientLoginStart {
@@ -20,6 +20,28 @@ impl Packet<Self> for ClientLoginStart {
     fn write_to(&self, writer: &mut impl std::io::Write) -> anyhow::Result<()> {
         self.username.write_as_mc_type(writer)?;
         self.uuid.write_as_mc_type(writer)?;
+        Ok(())
+    }
+}
+
+/// Variant of ClientLoginStart which only cares about the name.
+/// Different versions where handling the UUID differently.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct ClientLoginStartOnlyName {
+    pub username: String,
+}
+
+impl Packet<Self> for ClientLoginStartOnlyName {
+    fn packet_id() -> VarInt {
+        VarInt(0x00)
+    }
+    fn from_cursor(reader: &mut Cursor<&[u8]>) -> anyhow::Result<Self> {
+        Ok(Self {
+            username: String::read_as_mc_type(reader)?,
+        })
+    }
+    fn write_to(&self, writer: &mut impl std::io::Write) -> anyhow::Result<()> {
+        self.username.write_as_mc_type(writer)?;
         Ok(())
     }
 }

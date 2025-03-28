@@ -1,5 +1,3 @@
-#![feature(addr_parse_ascii)]
-
 use crate::protocol::client::handshake::ClientHandshake;
 use crate::protocol::client::login::{ClientLoginStart, ClientLoginStartOnlyName};
 use crate::protocol::client::status::{ClientStatusPing, ClientStatusRequest};
@@ -85,7 +83,7 @@ fn format_duration(duration: Duration) -> String {
         millis %= 1000 * 60 * 60;
     }
     if millis >= 1000 * 60 {
-        millis = millis / 1000 * 60;
+        minutes = millis / 1000 * 60;
         millis %= 1000 * 60;
     }
     if millis >= 1000 {

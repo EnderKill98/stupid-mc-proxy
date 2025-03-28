@@ -19,12 +19,18 @@ mod protocol;
 
 #[derive(Parser)]
 struct Opts {
-    bind: String,
-
+    /// Which host to connect clients to
     target_host: String,
+
+    /// Connect to a different port than the default one
     #[clap(short = 'p', long = "port", default_value = "25565")]
     target_port: u16,
 
+    /// The IP:Port combo the server is listening on
+    #[clap(short, long, default_value = "[::]:25565")]
+    bind: String,
+
+    /// Output longer errors on connection fails (might also need to set env RUST_BACKTRACE=1)
     #[clap(short, long)]
     verbose: bool,
 }
@@ -96,12 +102,21 @@ fn format_duration(duration: Duration) -> String {
         formatted.push_str(&format!("{hours}h"));
     }
     if minutes > 0 {
+        if !formatted.is_empty() {
+            formatted.push(' ');
+        }
         formatted.push_str(&format!("{minutes}m"));
     }
     if seconds > 0 {
+        if !formatted.is_empty() {
+            formatted.push(' ');
+        }
         formatted.push_str(&format!("{seconds}s"));
     }
     if hours == 0 && minutes == 0 && seconds < 10 {
+        if !formatted.is_empty() {
+            formatted.push(' ');
+        }
         formatted.push_str(&format!("{millis}ms"));
     }
 

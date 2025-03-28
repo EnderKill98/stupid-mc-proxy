@@ -85,11 +85,11 @@ fn format_duration(duration: Duration) -> String {
     let mut millis = duration.as_millis();
     let (mut hours, mut minutes, mut seconds) = (0, 0, 0);
     if millis >= 1000 * 60 * 60 {
-        hours = millis / 1000 * 60 * 60;
+        hours = millis / (1000 * 60 * 60);
         millis %= 1000 * 60 * 60;
     }
     if millis >= 1000 * 60 {
-        minutes = millis / 1000 * 60;
+        minutes = millis / (1000 * 60);
         millis %= 1000 * 60;
     }
     if millis >= 1000 {
@@ -294,7 +294,7 @@ fn handle_client(
     let mut buf = vec![0u8; 4096 * 16];
     let mut buf_2 = Vec::with_capacity(4096 * 32);
     loop {
-        std::thread::sleep(Duration::from_millis(25));
+        std::thread::sleep(Duration::from_millis(12));
 
         // Client -> Target
         buf_2.clear();
@@ -325,7 +325,7 @@ fn handle_client(
                 }
                 Err(err) => match err.kind() {
                     std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(25));
+                        std::thread::sleep(Duration::from_millis(12));
                         continue;
                     }
                     _ => return Err(err).context("Write to target"),
@@ -362,7 +362,7 @@ fn handle_client(
                 }
                 Err(err) => match err.kind() {
                     std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(25));
+                        std::thread::sleep(Duration::from_millis(12));
                         continue;
                     }
                     _ => return Err(err).context("Write to client"),

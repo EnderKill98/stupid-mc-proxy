@@ -7,6 +7,7 @@ use crate::protocol::Packet;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use log::{error, info};
+use polling::{Event, Events, Poller};
 use serde_json::Value;
 use std::io::{Cursor, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -33,6 +34,10 @@ struct Opts {
     /// Output longer errors on connection fails (might also need to set env RUST_BACKTRACE=1)
     #[clap(short, long)]
     verbose: bool,
+
+    /// Specify polling rate (in ms), -1 removes polling
+    #[clap(short, long, default_value = "50")]
+    delay: i32,
 }
 
 fn main() -> Result<()> {
@@ -53,6 +58,7 @@ fn main() -> Result<()> {
         let target_host = opts.target_host.to_owned();
         let target_port = opts.target_port.to_owned();
         let verbose = opts.verbose;
+        let delay = opts.delay;
         std::thread::spawn(move || {
             let entered_span = span!(
                 Level::INFO,
@@ -63,7 +69,7 @@ fn main() -> Result<()> {
             .entered();
             info!("Connected to new client");
             let start = Instant::now();
-            match handle_client(entered_span, client, target_host, target_port) {
+            match handle_client(entered_span, client, target_host, target_port, delay) {
                 Ok(_) => info!(
                     "Connection finished after {}",
                     format_duration(start.elapsed())
@@ -156,6 +162,7 @@ fn handle_client(
     mut client: TcpStream,
     target_host: String,
     target_port: u16,
+    delay: i32,
 ) -> Result<()> {
     // Resolve host
     // TODO: Improve on this ugliness!
@@ -299,7 +306,16 @@ fn handle_client(
     let mut buf = vec![0u8; 4096 * 16];
     let mut buf_2 = Vec::with_capacity(4096 * 32);
     loop {
-        std::thread::sleep(Duration::from_millis(25));
+        if delay < 0 {
+            let poller = Poller::new()?;
+            let mut events = Events::new();
+            unsafe { poller.add(&client, Event::readable(0))? };
+            unsafe { poller.add(&target, Event::readable(0))? };
+            //events.clear();
+            poller.wait(&mut events, None)?;
+        } else {
+            std::thread::sleep(Duration::from_millis(delay as u64));
+        }
 
         // Client -> Target
         buf_2.clear();

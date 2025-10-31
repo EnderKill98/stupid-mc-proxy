@@ -1,6 +1,7 @@
 use crate::protocol::client::handshake::ClientHandshake;
 use crate::protocol::client::login::{ClientLoginStart, ClientLoginStartOnlyName};
 use crate::protocol::client::status::{ClientStatusPing, ClientStatusRequest};
+use crate::protocol::server::login::ServerLoginDisconnect;
 use crate::protocol::server::status::{ServerStatusPongPacket, ServerStatusResponsePacket};
 use crate::protocol::types::{MinecraftDataType, VarInt};
 use crate::protocol::Packet;
@@ -9,8 +10,11 @@ use clap::Parser;
 use log::{error, info};
 use polling::{Event, Events, Poller};
 use serde_json::Value;
-use std::io::{Cursor, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use socket2::{Domain, Protocol, Socket, Type};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener, TcpStream};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tracing::span::EnteredSpan;
 use tracing::{span, Level};
@@ -31,6 +35,14 @@ struct Opts {
     #[clap(short, long, default_value = "[::]:25565")]
     bind: String,
 
+    /// Define a separate host to send (instead of target_host)
+    #[clap(short = 'a', long)]
+    alias_host: Option<String>,
+
+    /// Define a separate port to send (instead of target_port)
+    #[clap(short = 'P', long)]
+    alias_port: Option<u16>,
+
     /// Output longer errors on connection fails (might also need to set env RUST_BACKTRACE=1)
     #[clap(short, long)]
     verbose: bool,
@@ -38,6 +50,28 @@ struct Opts {
     /// Specify polling rate (in ms), -1 removes polling
     #[clap(short, long, default_value = "50")]
     delay: i32,
+
+    #[clap(short, long)]
+    source_ip: Vec<String>,
+}
+
+static SOURCES: LazyLock<Arc<Mutex<Vec<Arc<IpAddr>>>>> = LazyLock::new(|| Default::default());
+
+pub fn get_available_source_ip(v4: bool, v6: bool) -> Result<Option<Arc<IpAddr>>> {
+    let sources = SOURCES.lock().expect("Lock SOURCES");
+    if sources.is_empty() {
+        return Ok(None);
+    }
+
+    for ip in sources.iter() {
+        if Arc::strong_count(ip) > 1 {
+            continue;
+        }
+        if (ip.is_ipv4() && v4) || (ip.is_ipv6() && v6) {
+            return Ok(Some(ip.clone()));
+        }
+    }
+    Err(anyhow!("Out of Source IPs!"))
 }
 
 fn main() -> Result<()> {
@@ -50,6 +84,13 @@ fn main() -> Result<()> {
         .with(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    for source_ip in &opts.source_ip {
+        SOURCES
+            .lock()
+            .expect("Lock SOURCES")
+            .push(Arc::new(source_ip.parse::<IpAddr>()?));
+    }
+
     let server = TcpListener::bind(&opts.bind).context("Bind own server")?;
     info!("Ready");
 
@@ -57,6 +98,8 @@ fn main() -> Result<()> {
         let (client, addr) = server.accept().context("Accept new client")?;
         let target_host = opts.target_host.to_owned();
         let target_port = opts.target_port.to_owned();
+        let alias_host = opts.alias_host.as_ref().cloned();
+        let alias_port = opts.alias_port.as_ref().cloned();
         let verbose = opts.verbose;
         let delay = opts.delay;
         std::thread::spawn(move || {
@@ -64,12 +107,21 @@ fn main() -> Result<()> {
                 Level::INFO,
                 "conn",
                 ip = addr.ip().to_string(),
-                user = tracing::field::Empty
+                user = tracing::field::Empty,
+                via_ip = tracing::field::Empty,
             )
             .entered();
             info!("Connected to new client");
             let start = Instant::now();
-            match handle_client(entered_span, client, target_host, target_port, delay) {
+            match handle_client(
+                entered_span,
+                client,
+                target_host,
+                target_port,
+                alias_host,
+                alias_port,
+                delay,
+            ) {
                 Ok(_) => info!(
                     "Connection finished after {}",
                     format_duration(start.elapsed())
@@ -133,13 +185,15 @@ fn query_target_status_and_ping(
     target_addr: SocketAddr,
     target_host: &str,
     target_port: u16,
+    alias_host: Option<&str>,
+    alias_port: Option<u16>,
     protocol_version: i32,
 ) -> Result<(Value, u32)> {
     let mut target = TcpStream::connect(target_addr)?;
     ClientHandshake {
         protocol_version: VarInt(protocol_version),
-        server_address: target_host.to_owned(),
-        server_port: target_port,
+        server_address: alias_host.unwrap_or(target_host).to_owned(),
+        server_port: alias_port.unwrap_or(target_port),
         next_state: VarInt(1), // = Status
     }
     .write_with_header_to(&mut target)?;
@@ -162,15 +216,41 @@ fn handle_client(
     mut client: TcpStream,
     target_host: String,
     target_port: u16,
+    alias_host: Option<String>,
+    alias_port: Option<u16>,
     delay: i32,
 ) -> Result<()> {
     // Resolve host
     // TODO: Improve on this ugliness!
-    let addr_info = dns_lookup::getaddrinfo(Some(&target_host), None, None)
-        .map_err(|e| anyhow!("{:?}", e))?
-        .next()
-        .ok_or(anyhow!("Didn't find any result when resolving target host"))??;
-    let target_addr = SocketAddr::new(addr_info.sockaddr.ip(), target_port);
+    let mut target_addr_v4 = None;
+    let mut target_addr_v6 = None;
+
+    for addr_info in
+        dns_lookup::getaddrinfo(Some(&target_host), None, None).map_err(|e| anyhow!("{:?}", e))?
+    {
+        let addr_info = addr_info?;
+        match addr_info.sockaddr.ip() {
+            IpAddr::V4(ip) => {
+                if target_addr_v4.is_none() {
+                    target_addr_v4 = Some(SocketAddrV4::new(ip, target_port));
+                }
+            }
+            IpAddr::V6(ip) => {
+                if target_addr_v6.is_none() {
+                    target_addr_v6 = Some(SocketAddrV6::new(ip, target_port, 0, 0));
+                }
+            }
+        }
+    }
+
+    if target_addr_v4.is_none() && target_addr_v6.is_none() {
+        bail!("No address found for target host!");
+    }
+    let target_addr = if target_addr_v4.is_some() {
+        SocketAddr::V4(target_addr_v4.unwrap())
+    } else {
+        SocketAddr::V6(target_addr_v6.unwrap())
+    };
 
     // Get first packet from client
     let handshake =
@@ -188,6 +268,8 @@ fn handle_client(
             target_addr,
             &target_host,
             target_port,
+            alias_host.as_ref().map(|s| s.as_str()),
+            alias_port,
             *handshake.protocol_version,
         )?;
         info!(
@@ -244,19 +326,72 @@ fn handle_client(
         handshake.server_address, handshake.server_port, handshake.protocol_version
     );
 
-    let mut target = TcpStream::connect(target_addr).context("Connect to target")?;
+    let source_ip =
+        match get_available_source_ip(target_addr_v4.is_some(), target_addr_v6.is_some()) {
+            Ok(ip) => {
+                if let Some(ref ip) = ip {
+                    entered_span.record("via_ip", ip.to_string());
+                }
+                ip
+            }
+            Err(err) => {
+                ServerLoginDisconnect {
+                    reason: serde_json::json!({ "text": format!("StupidMCProxy Error: {err}") }),
+                }
+                .write_with_header_to(&mut client)
+                .context("Kick client due to error obtaining new source ip")?;
+                return Err(err);
+            }
+        };
+
+    //let mut target = TcpStream::connect(target_addr).context("Connect to target")?;
+    let mut target = match source_ip.as_ref().map(|ip| ip.as_ref()) {
+        Some(IpAddr::V4(addr)) => {
+            let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+            socket.set_reuse_address(true)?;
+            socket.set_reuse_port(true)?;
+            //socket.set_tcp_cork(true)?;
+            socket.bind(&SocketAddr::V4(SocketAddrV4::new(*addr, 0)).into())?;
+            socket
+                .connect(
+                    &target_addr_v4
+                        .ok_or(anyhow!("Expected resolved target IPv4"))?
+                        .into(),
+                )
+                .context("Connect to target (IPv4)")?;
+            socket.into()
+        }
+        Some(IpAddr::V6(addr)) => {
+            let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+            socket.set_reuse_address(true)?;
+            socket.set_reuse_port(true)?;
+            //socket.set_tcp_cork(true)?;
+            socket.bind(&SocketAddr::V6(SocketAddrV6::new(*addr, 0, 0, 0)).into())?;
+            socket
+                .connect(
+                    &target_addr_v6
+                        .ok_or(anyhow!("Expected resolved target IPv6"))?
+                        .into(),
+                )
+                .context("Connect to target (IPv6)")?;
+            socket.into()
+        }
+        _ => TcpStream::connect(target_addr).context("Connect to target")?,
+    };
+
     info!("Connected to target.");
 
     // Next state: Login (2)
     // Forward handshake with modified (server/host) to target
+    let mut initial_packets_buffer = Cursor::new(Vec::<u8>::new());
     ClientHandshake {
         protocol_version: handshake.protocol_version,
         next_state: VarInt(2),
-        server_port: target_port,
-        server_address: target_host,
+        server_port: alias_port.unwrap_or(target_port).to_owned(),
+        server_address: alias_host.unwrap_or(target_host).to_owned(),
     }
-    .write_with_header_to(&mut target)
-    .context("Send handshake to target")?;
+    .write_with_header_to(&mut initial_packets_buffer)
+    .context("Create handshake packet")?;
 
     {
         let (login_first_packet_id, login_first_packet_data) =
@@ -292,10 +427,20 @@ fn handle_client(
         let mut cursor = Cursor::new(Vec::with_capacity(4 + login_first_packet_data.len()));
         login_first_packet_id.write_as_mc_type(&mut cursor)?;
         cursor.write_all(&login_first_packet_data)?;
-        VarInt(cursor.position() as i32).write_as_mc_type(&mut target)?;
-        target.write_all(&cursor.into_inner())?;
+        VarInt(cursor.position() as i32).write_as_mc_type(&mut initial_packets_buffer)?;
+        initial_packets_buffer.write_all(&cursor.into_inner())?;
+
+        // Combining the first 2 packets is needed to bypass some weird TCPShield bot detection stuff
+        initial_packets_buffer.seek(SeekFrom::Start(0))?;
+        target.write_all(&initial_packets_buffer.into_inner())?;
     }
 
+    // Uncork
+    /*{
+        let socket = unsafe { Socket::from_raw_fd(target.as_raw_fd()) };
+        socket.set_tcp_cork(false)?;
+        let _ = socket.into_raw_fd(); // Don't close
+    }*/
     info!("Proxying raw data to each other...");
 
     client.set_nodelay(true)?;

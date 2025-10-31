@@ -1,11 +1,10 @@
 use crate::protocol::{types::*, Packet};
 use std::io::{Cursor, Read};
 
-/*
 /// Disconnect packet before logged in
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct ServerLoginDisconnect {
-    pub reason: Chat,
+    pub reason: serde_json::Value,
 }
 
 impl Packet<Self> for ServerLoginDisconnect {
@@ -14,15 +13,14 @@ impl Packet<Self> for ServerLoginDisconnect {
     }
     fn from_cursor(reader: &mut Cursor<&[u8]>) -> anyhow::Result<Self> {
         Ok(Self {
-            reason: Chat::read_as_mc_type(reader)?,
+            reason: serde_json::from_str(&String::read_as_mc_type(reader)?)?,
         })
     }
     fn write_to(&self, writer: &mut impl std::io::Write) -> anyhow::Result<()> {
-        self.reason.write_as_mc_type(writer)?;
+        serde_json::to_string(&self.reason)?.write_as_mc_type(writer)?;
         Ok(())
     }
 }
-*/
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct ServerLoginEncryptionRequest {

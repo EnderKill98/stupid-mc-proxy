@@ -3,10 +3,12 @@ use crate::protocol::types::MinecraftDataType;
 use self::types::VarInt;
 use anyhow::{bail, Context};
 use std::convert::TryFrom;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
 
 pub mod client;
 pub mod server;
+
+#[allow(dead_code)]
 pub mod types;
 
 pub fn read_raw_packet_id_and_data(reader: &mut impl Read) -> anyhow::Result<(VarInt, Vec<u8>)> {

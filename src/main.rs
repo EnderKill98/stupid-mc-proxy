@@ -13,7 +13,6 @@ use serde_json::Value;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener, TcpStream};
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tracing::span::EnteredSpan;
